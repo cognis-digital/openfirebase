@@ -1,5 +1,48 @@
 # openfirebase
 
+## Usage — step by step
+
+A typical local-backend lifecycle with the `openfirebase` console command:
+
+1. **Install** the CLI (puts `openfirebase` on your PATH):
+
+   ```bash
+   pipx install git+https://github.com/cognis-digital/openfirebase.git
+   ```
+
+2. **Start the server.** Begin with an ephemeral in-memory instance on `127.0.0.1:8080`:
+
+   ```bash
+   openfirebase serve --memory
+   ```
+
+   For a persistent instance that also hosts a front-end build, point it at a data dir and a public dir (the `serve` subcommand also accepts `--host`, `--port`, `--secret`, and `--spa`):
+
+   ```bash
+   openfirebase serve --data-dir ./.openfirebase --public ./public --spa
+   ```
+
+3. **Write and read data** without curl using the realtime-tree convenience subcommands. `set` takes a path and a JSON value; `get` takes a path. Both honor the top-level `--data-dir` / `--memory` flags, so target the same store your server uses:
+
+   ```bash
+   openfirebase --data-dir ./.openfirebase set rooms/r1 '{"name":"Lobby"}'
+   openfirebase --data-dir ./.openfirebase get rooms/r1
+   ```
+
+4. **Read the output.** `get` and `set` print the value as JSON to stdout, so pipe it straight into `jq` or a test assertion:
+
+   ```bash
+   openfirebase --data-dir ./.openfirebase get rooms/r1 | jq .name   # -> "Lobby"
+   ```
+
+5. **Use it in CI.** Seed fixtures against a throwaway data dir and assert on the JSON, no network or cloud account required:
+
+   ```bash
+   openfirebase version
+   openfirebase --data-dir ./ci-fixture set users/u1 '{"name":"Ada"}'
+   test "$(openfirebase --data-dir ./ci-fixture get users/u1 | jq -r .name)" = "Ada"
+   ```
+
 ## What is this?
 
 **openfirebase** is an independent, open-source **local** reimplementation of the
