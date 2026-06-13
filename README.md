@@ -52,7 +52,7 @@ no network round-trips. It is in the same spirit as LocalStack (for AWS), MinIO
 (for S3), or the Firebase Emulator Suite: a small, fast, self-contained stand-in
 for the real service that you point your app at during development.
 
-It gives a developer seven things behind one local HTTP server:
+It gives a developer eleven things behind one local HTTP server:
 
 - a **document database** (collections of JSON documents with `where` queries,
   subcollections, transactions, batched writes, and FieldValue sentinels),
@@ -68,7 +68,17 @@ It gives a developer seven things behind one local HTTP server:
   database events, Auth events, Storage events, HTTP requests, callable
   functions (structured errors), Pub/Sub messages, and scheduled jobs,
 - a **Cloud Storage** emulator (bucket/object store with upload/download/metadata
-  and download tokens), and
+  and download tokens),
+- a **Security Rules engine** (parse and evaluate a meaningful subset of the
+  Firestore/Storage rules DSL — wildcards, `request.auth`, `resource.data`,
+  type checks, `&&`/`||`/`!` — wired into the server via load/check endpoints),
+- a **Remote Config** store (parameters with default + conditional values,
+  named conditions, fetch-and-evaluate for a client context),
+- a **Cloud Messaging (FCM)** emulator (device token registry, topic
+  subscribe/unsubscribe, send to token/topic/multicast, local inbox for test
+  assertions — no real delivery),
+- an **App Check** emulator (issue/verify HMAC-signed tokens for all four
+  attestation providers in local mode, token revocation by JTI), and
 - a single shared storage backend (in-memory or SQLite) wiring all of them
   together.
 
@@ -99,6 +109,10 @@ openfirebase/
   hosting.py      static file server with index + SPA fallback + traversal guard
   functions.py    trigger registry + dispatcher (onCreate/onWrite/onRequest...)
   cloudstorage.py Cloud Storage emulator (buckets, objects, metadata, tokens)
+  rules.py        Security Rules engine — parse + evaluate Firestore/Storage DSL
+  remoteconfig.py Remote Config — parameters, conditions, fetch/evaluate
+  messaging.py    Cloud Messaging (FCM) — token registry, topics, send, inbox
+  appcheck.py     App Check — issue/verify HMAC tokens, revocation, app registry
   server.py       single ThreadingHTTPServer exposing every service
   cli.py          `openfirebase` console entry point + subcommands
 tests/            end-to-end + unit pytest suite
@@ -118,6 +132,10 @@ ephemeral instance. The HTTP layer is std-lib `http.server` only.
 | Hosting           | Hosting (deep)                   | `hosting.py`      | `/` (static) `/v1/hosting/...`    | directory index, SPA fallback, path-traversal guard, **rewrites** (path + function proxy), **redirects** (301/302/307/308), **custom headers** per glob pattern, **preview channels** (named overlay dirs) |
 | Functions         | Cloud Functions (deep)           | `functions.py`    | `/v1/functions/...`               | DB triggers (Firestore/RTDB, onCreate/onWrite/onUpdate/onDelete), **callable functions** (`on_call`, `FunctionError`), **Auth triggers** (onAuthUserCreate/onAuthUserDelete), **Storage triggers** (onStorageObjectFinalize/onStorageObjectDelete), **Pub/Sub** (publish + subscribe, per-topic), **scheduled functions** (register + run on demand), `onRequest` HTTP handlers, error isolation |
 | Cloud Storage     | Cloud Storage for Firebase       | `cloudstorage.py` | `/v1/storage/...`                 | buckets, objects (upload/download/delete/list), metadata (get/patch/custom_metadata), download tokens (generate/rotate), prefix listing, binary + base64 upload, MD5 checksum, Storage triggers wired to Functions |
+| Security Rules    | Firebase Security Rules (subset) | `rules.py`        | `/v1/rules/...`                   | parse+evaluate a meaningful subset of Firestore/Storage rules DSL (`allow read/write/get/list/create/update/delete`), static+wildcard path matching, `{wildcard}` + `{wildcard=**}` double-wildcard, `request.auth`, `resource.data`, `request.resource.data`, `is` type checks, `&&`/`\|\|`/`!`, wired into server `load`+`check` endpoints |
+| Remote Config     | Remote Config                    | `remoteconfig.py` | `/v1/remoteconfig/...`            | parameters (default + conditional values), named conditions (field/op/value predicates — `==`/`!=`/`contains`/`startsWith`/`matches`), `fetch` evaluates all params for a client context (first matching condition wins), `evaluate` single key, full template with version counter |
+| Cloud Messaging   | Firebase Cloud Messaging (FCM)   | `messaging.py`    | `/v1/messaging/...`               | device token registry, topic subscribe/unsubscribe, `send_to_token` / `send_to_topic` / `send_multicast` capture messages in local inbox, inbox list/get/clear, all messages stored for test assertions — no real delivery |
+| App Check         | Firebase App Check               | `appcheck.py`     | `/v1/appcheck/...`                | app registration, HMAC-signed tokens (`issue_token` — debug/device_check/play_integrity/app_attest providers all accepted in local mode), `verify_token` (signature + expiry + revocation + optional app_id match), token revocation by JTI, token listing |
 
 ## HTTP API reference
 
@@ -251,6 +269,90 @@ Hosting rewrites, redirects, and headers are configured in-process via the
 mutating the `app.hosting.rewrites` / `app.hosting.redirects` /
 `app.hosting.headers_rules` lists.
 
+### Security Rules (identity+security pass)
+
+```
+POST   /v1/rules/load                            load rules DSL
+    {"rules": "<rules source string>"}           → {"status":"ok"}
+POST   /v1/rules/check                           evaluate a rule
+    {
+        "service":              "cloud.firestore" | "firebase.storage",
+        "path":                 "/collection/doc",
+        "operation":            "get"|"list"|"create"|"update"|"delete",
+        "auth":                 {"sub":"uid",...} | null,
+        "resource_data":        {...},
+        "request_resource_data":{...}
+    }                                            → {"allowed": true|false}
+```
+
+### Remote Config (identity+security pass)
+
+```
+GET    /v1/remoteconfig/template                 full template (conditions+parameters+version)
+POST   /v1/remoteconfig/fetch                    evaluate config for client context
+    {"client_context": {"platform":"android",...}} → {"config":{key:value,...},"version":N}
+GET    /v1/remoteconfig/parameters               list all parameters
+POST   /v1/remoteconfig/parameters               create/replace parameter
+    {"key":"...","default_value":"...","conditional_values":[{"condition":"...","value":"..."},...]}
+GET    /v1/remoteconfig/parameters/<key>         get parameter
+PUT    /v1/remoteconfig/parameters/<key>         replace parameter
+DELETE /v1/remoteconfig/parameters/<key>         delete parameter
+GET    /v1/remoteconfig/conditions               list conditions
+POST   /v1/remoteconfig/conditions               create condition
+    {"name":"...","expression":[{"field":"...","op":"==","value":"..."},...]}
+GET    /v1/remoteconfig/conditions/<name>        get condition
+DELETE /v1/remoteconfig/conditions/<name>        delete condition
+```
+
+Condition ops: `==`, `!=`, `contains`, `startsWith`, `matches` (regex).
+
+### Cloud Messaging / FCM (identity+security pass)
+
+```
+POST   /v1/messaging/tokens                      register device token
+    {"token":"...","metadata":{...}}             → token record
+GET    /v1/messaging/tokens                      list registered tokens
+GET    /v1/messaging/tokens/<token>              get token record
+DELETE /v1/messaging/tokens/<token>              unregister token
+
+GET    /v1/messaging/topics                      list topics + subscriber lists
+GET    /v1/messaging/topics/<topic>              get topic
+POST   /v1/messaging/topics/<topic>/subscribe    subscribe token
+    {"token":"..."}
+POST   /v1/messaging/topics/<topic>/unsubscribe  unsubscribe token
+    {"token":"..."}
+
+POST   /v1/messaging/send                        capture a message
+    {"target_type":"token","token":"...","notification":{...},"data":{...}}
+    {"target_type":"topic","topic":"...","notification":{...},"data":{...}}
+    {"target_type":"multicast","tokens":[...],"notification":{...},"data":{...}}
+
+GET    /v1/messaging/messages                    list captured messages (inbox)
+GET    /v1/messaging/messages/<message_id>       get message
+```
+
+### App Check (identity+security pass)
+
+```
+POST   /v1/appcheck/apps                         register app
+    {"app_id":"...","providers":[...]}           → app record
+GET    /v1/appcheck/apps                         list registered apps
+GET    /v1/appcheck/apps/<app_id>                get app
+DELETE /v1/appcheck/apps/<app_id>                unregister app
+
+POST   /v1/appcheck/tokens                       issue App Check token
+    {"app_id":"...","provider":"debug","attestation_data":{...},"ttl":3600}
+    → {"token":"<signed-token>"}
+GET    /v1/appcheck/tokens                       list issued tokens (metadata)
+POST   /v1/appcheck/tokens/verify                verify token
+    {"token":"...","app_id":"..."}               → {"valid":true,"claims":{...}}
+POST   /v1/appcheck/tokens/<jti>/revoke          revoke token by JTI
+                                                 → {"revoked":true|false}
+```
+
+Supported providers: `debug`, `device_check`, `play_integrity`, `app_attest`
+(all accepted in local mode without real attestation).
+
 ## Library API highlights (new in messaging+compute pass)
 
 ```python
@@ -348,6 +450,61 @@ hosting.get_channel_url("beta")   # http://localhost:8080/__channel/beta/
 # serve with channel overlay:
 hosting.serve("/index.html", channel="beta")
 hosting.serve_with_headers("/index.html")  # (data, ctype, extra_headers)
+```
+
+## Library API highlights (identity+security pass)
+
+```python
+from openfirebase import (
+    RulesEngine, PermissionDenied,
+    RemoteConfig,
+    CloudMessaging,
+    AppCheck, AppCheckError,
+)
+
+# ---- Security Rules ----
+engine = RulesEngine()
+engine.load_rules('''
+    service cloud.firestore {
+        match /users/{uid} {
+            allow read: if true;
+            allow write: if request.auth != null && request.auth.uid == uid;
+        }
+    }
+''')
+ctx = engine.make_context(auth_payload={"sub": "u123"})
+engine.check("cloud.firestore", "/users/u123", "create", ctx)  # OK
+assert engine.is_allowed("cloud.firestore", "/users/u123", "create",
+                         engine.make_context()) is False  # no auth
+
+# ---- Remote Config ----
+rc = RemoteConfig()
+rc.set_condition("android", [{"field": "platform", "op": "==", "value": "android"}])
+rc.set_parameter("theme", "light",
+                 conditional_values=[{"condition": "android", "value": "dark"}])
+config = rc.fetch({"platform": "android"})   # {"theme": "dark"}
+val = rc.evaluate("theme", {"platform": "ios"})  # "light"
+
+# ---- Cloud Messaging ----
+msg = CloudMessaging()
+msg.register_token("device_tok_abc", metadata={"platform": "android"})
+msg.subscribe("device_tok_abc", "breaking-news")
+msg.send_to_topic("breaking-news",
+                  notification={"title": "Big story", "body": "Details..."})
+msg.send_to_token("device_tok_abc", data={"action": "refresh"})
+messages = msg.list_messages(target_type="token")
+msg.clear_inbox()
+
+# ---- App Check ----
+ac = AppCheck(secret="dev-secret")
+ac.register_app("1:123456:android:abcdef")
+token = ac.issue_token("1:123456:android:abcdef", provider="debug")
+payload = ac.verify_token(token)          # {"sub":"1:123456:android:abcdef",...}
+ac.revoke_token(payload["jti"])
+try:
+    ac.verify_token(token)                # raises AppCheckError("token has been revoked")
+except AppCheckError:
+    pass
 ```
 
 ## Library API highlights (storage+data pass)
@@ -508,7 +665,7 @@ The test suite is real and end-to-end: the HTTP server is started in a
 background thread and data is round-tripped through every service over the wire,
 alongside direct unit tests of each service class and both storage backends.
 
-- **352 tests, all passing** (`python -m pytest -q`) on Python 3.14 locally.
+- **519 tests, all passing** (`python -m pytest -q`) on Python 3.14 locally.
 - CI runs the same suite on **ubuntu / macOS / windows × Python 3.10–3.13**
   (see `.github/workflows/ci.yml`).
 
@@ -540,6 +697,20 @@ server (finalize on upload, delete on object delete), auth triggers wired via
 server (onCreate on signup, onDelete on user delete), hosting management HTTP
 endpoints (channels list/create/delete), callable+pubsub+schedule HTTP endpoints,
 the CLI, and the full HTTP server end-to-end for all services.
+Security Rules (tokeniser, path matching with single/double wildcards, all
+expression operators — `==`/`!=`/`&&`/`||`/`!`/`is`, `request.auth` + uid +
+token claims, `resource.data` + `request.resource.data` comparisons, compound
+`read`/`write` op expansion, service routing, `is_allowed` bool helper, server
+load/check endpoints), Remote Config (parameter CRUD, condition CRUD, fetch with
+condition evaluation for all operators, `evaluate` single key, version counter,
+full template, server endpoints), Cloud Messaging (token register/unregister,
+topic subscribe/unsubscribe/idempotency/cascading-unregister, send to token /
+topic / multicast, inbox list/get/filter/limit/clear, data-as-strings coercion,
+server round-trip for all operations), App Check (app register/get/list/unregister,
+token issue for all four providers, custom TTL, attestation data embedding, verify
+success + app_id match + mismatch + tamper + wrong secret + expired + wrong-type +
+revoked, revocation by JTI, list-filtered-by-app_id, server round-trip for all
+operations).
 
 ## Roadmap (not yet implemented)
 
@@ -547,8 +718,8 @@ These are intentionally **not** built yet and are listed honestly so nothing is
 overclaimed:
 
 - Firestore: collection-group queries, collection enumeration, real-time
-  listeners/streaming, index-enforced composite sorts, security rules.
-- Realtime DB: server-sent-event subscriptions, security rules, persistent
+  listeners/streaming, index-enforced composite sorts.
+- Realtime DB: server-sent-event subscriptions, persistent
   onDisconnect across connections (current stub is in-process only).
 - Auth: real OAuth/OIDC round-trips (current provider sign-in is a stub that
   skips the provider redirect flow); refresh tokens (current tokens are
@@ -560,6 +731,18 @@ overclaimed:
   (current download tokens are opaque UUIDs, not time-limited signed URLs).
 - Hosting: CDN-style cache headers, i18n rewrites, multi-site support beyond
   named in-process overlay channels.
+- Security Rules: full `get()` / `exists()` cross-document reads inside rule
+  expressions, `request.time` / duration checks, full Firestore path function
+  set (`path()`, `toSet()`, etc.), server-side rule enforcement wired into
+  every Firestore/Storage operation (current wiring is via explicit `check`
+  endpoint only).
+- Remote Config: A/B test percentile targeting, rollout percentage conditions,
+  user-property targeting beyond custom field comparisons.
+- Cloud Messaging: actual delivery to real FCM endpoints, collapse-key / TTL
+  semantics, analytics event tracking.
+- App Check: real Play Integrity / DeviceCheck / App Attest network verification
+  (current providers are all accepted locally without real attestation); token
+  exchange endpoint compatible with the Firebase SDK.
 
 ## License
 

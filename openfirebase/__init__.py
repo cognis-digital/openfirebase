@@ -18,8 +18,12 @@ from .functions import (
 )
 from .hosting import Hosting
 from .cloudstorage import CloudStorage, StorageBucket, ObjectNotFoundError
+from .rules import RulesEngine, RulesError, PermissionDenied
+from .remoteconfig import RemoteConfig, RemoteConfigError
+from .messaging import CloudMessaging, MessagingError
+from .appcheck import AppCheck, AppCheckError
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Firestore",
@@ -50,5 +54,14 @@ __all__ = [
     "CloudStorage",
     "StorageBucket",
     "ObjectNotFoundError",
+    "RulesEngine",
+    "RulesError",
+    "PermissionDenied",
+    "RemoteConfig",
+    "RemoteConfigError",
+    "CloudMessaging",
+    "MessagingError",
+    "AppCheck",
+    "AppCheckError",
     "__version__",
 ]

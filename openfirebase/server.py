@@ -31,6 +31,27 @@ Path prefixes
 * ``/v1/storage``                             - list buckets
 * ``/v1/hosting/channels``                    - list preview channels (GET)
 * ``/v1/hosting/channels/<name>``             - create/delete preview channel
+* ``/v1/rules/load``                          - load security rules (POST)
+* ``/v1/rules/check``                         - evaluate a rule (POST)
+* ``/v1/remoteconfig/parameters``             - list/set parameters
+* ``/v1/remoteconfig/parameters/<key>``       - get/delete parameter
+* ``/v1/remoteconfig/conditions``             - list/set conditions
+* ``/v1/remoteconfig/conditions/<name>``      - get/delete condition
+* ``/v1/remoteconfig/fetch``                  - fetch evaluated config (POST)
+* ``/v1/remoteconfig/template``               - full template (GET)
+* ``/v1/messaging/tokens``                    - register/list tokens
+* ``/v1/messaging/tokens/<token>``            - get/delete token
+* ``/v1/messaging/topics``                    - list topics
+* ``/v1/messaging/topics/<topic>/subscribe``  - subscribe token (POST)
+* ``/v1/messaging/topics/<topic>/unsubscribe``- unsubscribe token (POST)
+* ``/v1/messaging/send``                      - send to token/topic (POST)
+* ``/v1/messaging/messages``                  - list inbox (GET)
+* ``/v1/messaging/messages/<id>``             - get message (GET)
+* ``/v1/appcheck/apps``                       - register/list apps
+* ``/v1/appcheck/apps/<app_id>``              - get/delete app
+* ``/v1/appcheck/tokens``                     - issue token (POST) / list (GET)
+* ``/v1/appcheck/tokens/verify``              - verify token (POST)
+* ``/v1/appcheck/tokens/<jti>/revoke``        - revoke token (POST)
 * ``/__health``                               - liveness probe
 * anything else                               - static hosting (if enabled)
 
@@ -46,6 +67,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
+from .appcheck import AppCheck, AppCheckError
 from .auth import AuthService, AuthError
 from .cloudstorage import CloudStorage, ObjectNotFoundError
 from .firestore import Firestore, FieldValue, TransactionError
@@ -53,7 +75,10 @@ from .functions import (FunctionRegistry, ON_CREATE, ON_UPDATE, ON_DELETE,
                         ON_STORAGE_FINALIZE, ON_STORAGE_DELETE,
                         ON_AUTH_USER_CREATE, ON_AUTH_USER_DELETE)
 from .hosting import Hosting
+from .messaging import CloudMessaging, MessagingError
+from .remoteconfig import RemoteConfig
 from .rtdb import RealtimeDatabase
+from .rules import RulesEngine, RulesError, PermissionDenied
 from .storage import make_store
 
 
@@ -72,6 +97,10 @@ class App:
         self.hosting = Hosting(public_dir, spa_fallback=spa_fallback) \
             if public_dir else None
         self.cloud_storage = CloudStorage(self.store)
+        self.rules = RulesEngine()
+        self.remote_config = RemoteConfig(self.store)
+        self.messaging = CloudMessaging(self.store)
+        self.app_check = AppCheck(self.store, secret=secret)
 
 
 def _make_handler(app: App):
@@ -158,9 +187,25 @@ def _make_handler(app: App):
                 if path.startswith("/v1/hosting"):
                     body = self._safe_json_body(method)
                     return self._hosting_mgmt(method, path, body)
+                if path.startswith("/v1/rules"):
+                    body = self._safe_json_body(method)
+                    return self._rules_route(method, path, body)
+                if path.startswith("/v1/remoteconfig"):
+                    body = self._safe_json_body(method)
+                    return self._remoteconfig_route(method, path, body)
+                if path.startswith("/v1/messaging"):
+                    body = self._safe_json_body(method)
+                    return self._messaging_route(method, path, body)
+                if path.startswith("/v1/appcheck"):
+                    body = self._safe_json_body(method)
+                    return self._appcheck_route(method, path, body)
                 return self._static(path)
             except AuthError as exc:
                 return self._send_json({"error": str(exc)}, 401)
+            except AppCheckError as exc:
+                return self._send_json({"error": str(exc)}, 401)
+            except PermissionDenied as exc:
+                return self._send_json({"error": str(exc)}, 403)
             except Exception as exc:  # pragma: no cover - defensive
                 return self._send_json({"error": str(exc)}, 500)
 
@@ -807,6 +852,320 @@ def _make_handler(app: App):
                 except ObjectNotFoundError:
                     return self._send_json({"error": "not found"}, 404)
             return self._send_json({"error": "method not allowed"}, 405)
+
+        # ---- security rules --------------------------------------------------
+        def _rules_route(self, method, path, body):
+            sub = path[len("/v1/rules"):]
+
+            # POST /v1/rules/load — load rules DSL
+            if sub in ("/load", "/load/"):
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                src = body.get("rules", "") if isinstance(body, dict) else ""
+                if not src:
+                    return self._send_json({"error": "rules field required"}, 400)
+                try:
+                    app.rules.load_rules(src)
+                    return self._send_json({"status": "ok"})
+                except RulesError as exc:
+                    return self._send_json({"error": str(exc)}, 400)
+
+            # POST /v1/rules/check — evaluate a rule
+            if sub in ("/check", "/check/"):
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                service = body.get("service", "cloud.firestore")
+                resource_path = body.get("path", "/")
+                operation = body.get("operation", "get")
+                auth_payload = body.get("auth")
+                resource_data = body.get("resource_data")
+                request_resource_data = body.get("request_resource_data")
+                ctx = app.rules.make_context(
+                    auth_payload=auth_payload,
+                    resource_data=resource_data,
+                    request_resource_data=request_resource_data,
+                )
+                allowed = app.rules.is_allowed(service, resource_path, operation, ctx)
+                return self._send_json({"allowed": allowed})
+
+            return self._send_json({"error": "unknown rules endpoint"}, 404)
+
+        # ---- remote config ---------------------------------------------------
+        def _remoteconfig_route(self, method, path, body):
+            sub = path[len("/v1/remoteconfig"):]
+            rc = app.remote_config
+
+            # GET /v1/remoteconfig/template
+            if sub in ("/template", "/template/"):
+                if method != "GET":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                return self._send_json(rc.get_template())
+
+            # POST /v1/remoteconfig/fetch
+            if sub in ("/fetch", "/fetch/"):
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                client_ctx = body.get("client_context", {}) \
+                    if isinstance(body, dict) else {}
+                return self._send_json({"config": rc.fetch(client_ctx),
+                                        "version": rc.get_version()})
+
+            # /v1/remoteconfig/parameters
+            if sub in ("/parameters", "/parameters/"):
+                if method == "GET":
+                    return self._send_json({"parameters": rc.list_parameters()})
+                if method == "POST":
+                    key = body.get("key", "")
+                    if not key:
+                        return self._send_json({"error": "key required"}, 400)
+                    rc.set_parameter(
+                        key,
+                        str(body.get("default_value", "")),
+                        body.get("conditional_values"),
+                    )
+                    return self._send_json(rc.get_parameter(key), 201)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/parameters/"):
+                key = sub[len("/parameters/"):]
+                if method == "GET":
+                    param = rc.get_parameter(key)
+                    if param is None:
+                        return self._send_json({"error": "not found"}, 404)
+                    return self._send_json(param)
+                if method == "DELETE":
+                    ok = rc.delete_parameter(key)
+                    return self._send_json({"deleted": ok})
+                if method in ("PUT", "PATCH"):
+                    rc.set_parameter(
+                        key,
+                        str(body.get("default_value", "")),
+                        body.get("conditional_values"),
+                    )
+                    return self._send_json(rc.get_parameter(key))
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            # /v1/remoteconfig/conditions
+            if sub in ("/conditions", "/conditions/"):
+                if method == "GET":
+                    return self._send_json({"conditions": rc.list_conditions()})
+                if method == "POST":
+                    name = body.get("name", "")
+                    if not name:
+                        return self._send_json({"error": "name required"}, 400)
+                    rc.set_condition(name, body.get("expression", []))
+                    return self._send_json(rc.get_condition(name), 201)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/conditions/"):
+                name = sub[len("/conditions/"):]
+                if method == "GET":
+                    cond = rc.get_condition(name)
+                    if cond is None:
+                        return self._send_json({"error": "not found"}, 404)
+                    return self._send_json(cond)
+                if method == "DELETE":
+                    ok = rc.delete_condition(name)
+                    return self._send_json({"deleted": ok})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            return self._send_json({"error": "unknown remoteconfig endpoint"}, 404)
+
+        # ---- cloud messaging -------------------------------------------------
+        def _messaging_route(self, method, path, body):
+            sub = path[len("/v1/messaging"):]
+            msg = app.messaging
+
+            # POST /v1/messaging/send
+            if sub in ("/send", "/send/"):
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                target_type = body.get("target_type", "token")
+                notification = body.get("notification")
+                data = body.get("data")
+                if target_type == "token":
+                    token = body.get("token", "")
+                    try:
+                        record = msg.send_to_token(
+                            token, notification=notification, data=data)
+                    except MessagingError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json(record, 201)
+                if target_type == "topic":
+                    topic = body.get("topic", "")
+                    try:
+                        record = msg.send_to_topic(
+                            topic, notification=notification, data=data)
+                    except MessagingError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json(record, 201)
+                if target_type == "multicast":
+                    tokens = body.get("tokens", [])
+                    try:
+                        record = msg.send_multicast(
+                            tokens, notification=notification, data=data)
+                    except MessagingError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json(record, 201)
+                return self._send_json({"error": f"unknown target_type {target_type!r}"}, 400)
+
+            # /v1/messaging/tokens
+            if sub in ("/tokens", "/tokens/"):
+                if method == "GET":
+                    return self._send_json({"tokens": msg.list_tokens()})
+                if method == "POST":
+                    token = body.get("token", "")
+                    try:
+                        record = msg.register_token(
+                            token, metadata=body.get("metadata"))
+                    except MessagingError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json(record, 201)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/tokens/"):
+                token = sub[len("/tokens/"):]
+                if method == "GET":
+                    record = msg.get_token(token)
+                    if record is None:
+                        return self._send_json({"error": "not found"}, 404)
+                    return self._send_json(record)
+                if method == "DELETE":
+                    ok = msg.unregister_token(token)
+                    return self._send_json({"deleted": ok})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            # /v1/messaging/topics
+            if sub in ("/topics", "/topics/"):
+                if method == "GET":
+                    return self._send_json({"topics": msg.list_topics()})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/topics/"):
+                rest = sub[len("/topics/"):]
+                parts = rest.split("/")
+                topic_name = parts[0]
+                action = parts[1] if len(parts) > 1 else ""
+
+                if action == "subscribe":
+                    if method != "POST":
+                        return self._send_json({"error": "method not allowed"}, 405)
+                    token = body.get("token", "")
+                    try:
+                        msg.subscribe(token, topic_name)
+                    except MessagingError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json({"status": "ok", "topic": topic_name,
+                                            "token": token})
+
+                if action == "unsubscribe":
+                    if method != "POST":
+                        return self._send_json({"error": "method not allowed"}, 405)
+                    token = body.get("token", "")
+                    ok = msg.unsubscribe(token, topic_name)
+                    return self._send_json({"status": "ok", "removed": ok})
+
+                if not action:
+                    if method == "GET":
+                        topic_data = msg.get_topic(topic_name)
+                        if topic_data is None:
+                            return self._send_json({"error": "not found"}, 404)
+                        return self._send_json(topic_data)
+                    return self._send_json({"error": "method not allowed"}, 405)
+
+            # /v1/messaging/messages
+            if sub in ("/messages", "/messages/"):
+                if method == "GET":
+                    return self._send_json({"messages": msg.list_messages()})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/messages/"):
+                msg_id = sub[len("/messages/"):]
+                if method == "GET":
+                    record = msg.get_message(msg_id)
+                    if record is None:
+                        return self._send_json({"error": "not found"}, 404)
+                    return self._send_json(record)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            return self._send_json({"error": "unknown messaging endpoint"}, 404)
+
+        # ---- app check -------------------------------------------------------
+        def _appcheck_route(self, method, path, body):
+            sub = path[len("/v1/appcheck"):]
+            ac = app.app_check
+
+            # /v1/appcheck/apps
+            if sub in ("/apps", "/apps/"):
+                if method == "GET":
+                    return self._send_json({"apps": ac.list_apps()})
+                if method == "POST":
+                    app_id = body.get("app_id", "")
+                    try:
+                        record = ac.register_app(
+                            app_id, providers=body.get("providers"))
+                    except AppCheckError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json(record, 201)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/apps/"):
+                app_id = sub[len("/apps/"):]
+                if method == "GET":
+                    record = ac.get_app(app_id)
+                    if record is None:
+                        return self._send_json({"error": "not found"}, 404)
+                    return self._send_json(record)
+                if method == "DELETE":
+                    ok = ac.unregister_app(app_id)
+                    return self._send_json({"deleted": ok})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            # POST /v1/appcheck/tokens/verify
+            if sub in ("/tokens/verify", "/tokens/verify/"):
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                token = body.get("token", "")
+                expected_app_id = body.get("app_id")
+                try:
+                    payload = ac.verify_token(token, expected_app_id=expected_app_id)
+                    return self._send_json({"valid": True, "claims": payload})
+                except AppCheckError as exc:
+                    return self._send_json({"error": str(exc)}, 401)
+
+            # /v1/appcheck/tokens
+            if sub in ("/tokens", "/tokens/"):
+                if method == "GET":
+                    app_id_filter = None
+                    return self._send_json({"tokens": ac.list_tokens(app_id_filter)})
+                if method == "POST":
+                    app_id = body.get("app_id", "")
+                    provider = body.get("provider", "debug")
+                    attestation = body.get("attestation_data")
+                    ttl = body.get("ttl")
+                    try:
+                        token = ac.issue_token(
+                            app_id, provider=provider,
+                            attestation_data=attestation, ttl=ttl)
+                    except AppCheckError as exc:
+                        return self._send_json({"error": str(exc)}, 400)
+                    return self._send_json({"token": token}, 201)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("/tokens/"):
+                rest = sub[len("/tokens/"):]
+                parts = rest.split("/")
+                jti = parts[0]
+                action = parts[1] if len(parts) > 1 else ""
+
+                if action == "revoke":
+                    if method != "POST":
+                        return self._send_json({"error": "method not allowed"}, 405)
+                    ok = ac.revoke_token(jti)
+                    return self._send_json({"revoked": ok})
+                return self._send_json({"error": "unknown appcheck token endpoint"}, 404)
+
+            return self._send_json({"error": "unknown appcheck endpoint"}, 404)
 
         # ---- static hosting (file serving) ----------------------------------
         def _static(self, path):
