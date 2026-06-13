@@ -6,22 +6,32 @@ APIs it is compatible with. Vendor names are used only nominatively to describe 
 compatibility. It implements a compatible SUBSET and is not intended for production.
 """
 
-from .firestore import Firestore, Query
-from .rtdb import RealtimeDatabase
+from .firestore import Firestore, Query, FieldValue, WriteBatch, Transaction, TransactionError
+from .rtdb import RealtimeDatabase, RTDBQuery, OnDisconnect
 from .auth import AuthService, AuthError
 from .functions import FunctionRegistry, trigger
 from .hosting import Hosting
+from .cloudstorage import CloudStorage, StorageBucket, ObjectNotFoundError
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Firestore",
     "Query",
+    "FieldValue",
+    "WriteBatch",
+    "Transaction",
+    "TransactionError",
     "RealtimeDatabase",
+    "RTDBQuery",
+    "OnDisconnect",
     "AuthService",
     "AuthError",
     "FunctionRegistry",
     "trigger",
     "Hosting",
+    "CloudStorage",
+    "StorageBucket",
+    "ObjectNotFoundError",
     "__version__",
 ]

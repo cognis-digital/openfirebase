@@ -52,15 +52,21 @@ no network round-trips. It is in the same spirit as LocalStack (for AWS), MinIO
 (for S3), or the Firebase Emulator Suite: a small, fast, self-contained stand-in
 for the real service that you point your app at during development.
 
-It gives a developer five things behind one local HTTP server:
+It gives a developer seven things behind one local HTTP server:
 
-- a **document database** (collections of JSON documents with `where` queries),
-- a **realtime JSON tree** (read/write/merge/push at any path),
+- a **document database** (collections of JSON documents with `where` queries,
+  subcollections, transactions, batched writes, and FieldValue sentinels),
+- a **realtime JSON tree** (read/write/merge/push at any path, orderByChild
+  queries, atomic transactions, onDisconnect/presence stubs),
 - a **local auth** service (email/password sign-up & sign-in issuing signed
   local tokens you can verify — for dev only, **not** a real identity provider),
-- a **static hosting** server for your front-end build output, and
+- a **static hosting** server for your front-end build output,
 - a **function-trigger runner** that fires your Python handlers on database
-  events (`onCreate` / `onWrite` / `onDelete`) or HTTP requests (`onRequest`).
+  events (`onCreate` / `onWrite` / `onDelete`) or HTTP requests (`onRequest`),
+- a **Cloud Storage** emulator (bucket/object store with upload/download/metadata
+  and download tokens), and
+- a single shared storage backend (in-memory or SQLite) wiring all of them
+  together.
 
 **Who it is for:** developers who want a zero-dependency, scriptable local
 backend for prototypes, integration tests, CI, demos, and working on a plane.
@@ -83,11 +89,12 @@ openfirebase/
   __init__.py     public API surface
   __main__.py     enables `python -m openfirebase`
   storage.py      key/value backends: MemoryStore + SqliteStore
-  firestore.py    document database + chainable Query (where/order_by/limit)
-  rtdb.py         realtime JSON tree (get/set/update/push/delete by path)
+  firestore.py    document database + chainable Query + FieldValue + WriteBatch + Transaction
+  rtdb.py         realtime JSON tree + RTDBQuery + transactions + OnDisconnect stub
   auth.py         local email/password auth + HMAC-signed local tokens
   hosting.py      static file server with index + SPA fallback + traversal guard
   functions.py    trigger registry + dispatcher (onCreate/onWrite/onRequest...)
+  cloudstorage.py Cloud Storage emulator (buckets, objects, metadata, tokens)
   server.py       single ThreadingHTTPServer exposing every service
   cli.py          `openfirebase` console entry point + subcommands
 tests/            end-to-end + unit pytest suite
@@ -99,13 +106,155 @@ ephemeral instance. The HTTP layer is std-lib `http.server` only.
 
 ## Services
 
-| Service    | Emulates                  | Module          | HTTP prefix          | Highlights                                                    |
-|------------|---------------------------|-----------------|----------------------|---------------------------------------------------------------|
-| Firestore  | Cloud Firestore (subset)  | `firestore.py`  | `/v1/firestore/...`  | collections/documents, `where` (`==`,`<`,`in`,`array-contains`,…), `order_by`, `limit`, merge |
-| Realtime   | Realtime Database (subset)| `rtdb.py`       | `/v1/rtdb/...`       | JSON tree, `get`/`set`/`update`/`push` (sortable push ids)/`delete` |
-| Auth       | Authentication (subset)   | `auth.py`       | `/v1/auth/...`       | email+password, PBKDF2 hashing, HMAC local tokens, verify     |
-| Hosting    | Hosting (subset)          | `hosting.py`    | `/` (static)         | directory index, SPA fallback, path-traversal protection      |
-| Functions  | Cloud Functions (subset)  | `functions.py`  | `/v1/functions/...`  | DB triggers + `onRequest` HTTP handlers, error isolation      |
+| Service           | Emulates                         | Module            | HTTP prefix                       | Highlights                                                                                                             |
+|-------------------|----------------------------------|-------------------|-----------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| Firestore         | Cloud Firestore (subset)         | `firestore.py`    | `/v1/firestore/...`               | collections/documents, `where` (all operators incl. `array-contains-any`), `order_by`, `limit`/`limit_to_last`, cursor pagination (`start_after`/`start_at`/`end_before`/`end_at`), composite AND filters, subcollections, `FieldValue` (increment/arrayUnion/arrayRemove/serverTimestamp/delete), `WriteBatch`, `Transaction` (optimistic-lock + retry), merge |
+| Realtime DB       | Realtime Database (subset)       | `rtdb.py`         | `/v1/rtdb/...`                    | JSON tree, `get`/`set`/`update`/`push`/`delete`, `RTDBQuery` (orderByChild/orderByKey/orderByValue/equalTo/startAt/endAt/limitToFirst/limitToLast), atomic `transaction`, `OnDisconnect` presence stub |
+| Auth              | Authentication (subset)          | `auth.py`         | `/v1/auth/...`                    | email+password, PBKDF2 hashing, HMAC local tokens, verify                                                             |
+| Hosting           | Hosting (subset)                 | `hosting.py`      | `/` (static)                      | directory index, SPA fallback, path-traversal protection                                                               |
+| Functions         | Cloud Functions (subset)         | `functions.py`    | `/v1/functions/...`               | DB triggers + `onRequest` HTTP handlers, error isolation                                                               |
+| Cloud Storage     | Cloud Storage for Firebase       | `cloudstorage.py` | `/v1/storage/...`                 | buckets, objects (upload/download/delete/list), metadata (get/patch/custom_metadata), download tokens (generate/rotate), prefix listing, binary + base64 upload, MD5 checksum |
+
+## HTTP API reference
+
+### Firestore
+
+```
+POST   /v1/firestore/<col>                      create doc (auto id)
+GET    /v1/firestore/<col>/<id>                 get doc
+PUT    /v1/firestore/<col>/<id>                 set/replace doc
+PATCH  /v1/firestore/<col>/<id>                 update (merge) doc
+DELETE /v1/firestore/<col>/<id>                 delete doc
+GET    /v1/firestore/<col>                      list collection
+
+# Subcollections — use ~ as separator in URL
+POST   /v1/firestore/<col>/<doc>/~/<subcol>     add subcollection doc
+GET    /v1/firestore/<col>/<doc>/~/<subcol>/<id>  get subcollection doc
+
+# Advanced query
+POST   /v1/firestore/_query/<col>               structured query (see below)
+POST   /v1/firestore/_batch                     batched writes
+POST   /v1/firestore/_transaction               server-side transaction
+```
+
+**POST /v1/firestore/_query/&lt;col&gt;** body:
+```json
+{
+    "where":    [{"field": "price", "op": ">", "value": 2}],
+    "order_by": [{"field": "price", "direction": "asc"}],
+    "limit":    10,
+    "start_after": {"price": 2},
+    "end_at":      {"price": 5}
+}
+```
+
+**POST /v1/firestore/_batch** body:
+```json
+{
+    "writes": [
+        {"op": "set",    "collection": "cities", "id": "LA", "data": {"pop": 4000000}},
+        {"op": "update", "collection": "cities", "id": "LA", "data": {"pop": 4100000}},
+        {"op": "delete", "collection": "old",    "id": "x"}
+    ]
+}
+```
+
+### Realtime Database
+
+```
+GET    /v1/rtdb/<path>                   read value
+PUT    /v1/rtdb/<path>                   set value
+PATCH  /v1/rtdb/<path>                   shallow merge
+POST   /v1/rtdb/<path>                   push (auto-key child)
+DELETE /v1/rtdb/<path>                   delete
+
+# Query (all params are JSON-serialised query-string values)
+GET    /v1/rtdb/_query/<path>?orderByChild=field&limitToFirst=5
+GET    /v1/rtdb/_query/<path>?orderByKey=1&equalTo=mykey
+GET    /v1/rtdb/_query/<path>?orderByValue=1&startAt=10&endAt=50
+
+# Atomic transaction
+POST   /v1/rtdb/_transaction/<path>      {"op":"increment","value":1}
+                                         {"op":"set_if_null","value":true}
+                                         {"op":"set","value":42}
+```
+
+### Cloud Storage
+
+```
+GET    /v1/storage                       list buckets
+GET    /v1/storage/<bucket>/o            list objects (optional ?prefix=...)
+POST   /v1/storage/<bucket>/o/<name>     upload object
+    Content-Type: application/json → {"base64_data":"...","content_type":"...","custom_metadata":{}}
+    Content-Type: <anything else>  → raw bytes
+GET    /v1/storage/<bucket>/o/<name>     download object (returns raw bytes)
+DELETE /v1/storage/<bucket>/o/<name>     delete object
+GET    /v1/storage/<bucket>/o/<name>/meta    get object metadata
+PATCH  /v1/storage/<bucket>/o/<name>/meta   update custom_metadata
+POST   /v1/storage/<bucket>/o/<name>/token  rotate download token
+```
+
+## Library API highlights (new in storage+data pass)
+
+```python
+from openfirebase import Firestore, RealtimeDatabase, CloudStorage
+from openfirebase.firestore import FieldValue, TransactionError
+
+# ---- Firestore ----
+fs = Firestore()
+# FieldValue sentinels
+fs.set("products", "p1", {"stock": 10, "tags": ["new"]})
+fs.update("products", "p1", {
+    "stock": FieldValue.increment(-1),
+    "tags":  FieldValue.array_union(["sale"]),
+    "draft": FieldValue.delete(),
+    "ts":    FieldValue.server_timestamp(),
+})
+
+# Cursor pagination
+page1 = fs.collection("products").order_by("price").limit(10).stream()
+page2 = fs.collection("products").order_by("price").start_after(page1[-1]).limit(10).stream()
+
+# Subcollection
+fs.set("users/u1/orders", "o1", {"amount": 100})
+
+# Batched writes
+batch = fs.batch()
+batch.set("c", "d1", {"v": 1}).update("c", "d2", {"v": 2}).delete("c", "d3")
+batch.commit()
+
+# Transactions
+def transfer(txn):
+    src = txn.get("accounts", "alice")
+    dst = txn.get("accounts", "bob")
+    txn.update("accounts", "alice", {"balance": src["balance"] - 10})
+    txn.update("accounts", "bob",   {"balance": dst["balance"] + 10})
+
+fs.run_transaction(transfer)
+
+# ---- Realtime Database ----
+db = RealtimeDatabase()
+# Queries
+results = db.query("/scores").order_by_child("score").limit_to_first(3).get()
+equal = db.query("/msgs").order_by_child("uid").equal_to("u1").get()
+
+# Atomic transaction
+db.transaction("/counters/visits", lambda n: (n or 0) + 1)
+
+# onDisconnect (presence stub)
+db.on_disconnect("/presence/u1").set("offline")
+db.simulate_disconnect("/presence/u1")
+
+# ---- Cloud Storage ----
+cs = CloudStorage()
+bucket = cs.bucket("my-app.appspot.com")
+bucket.upload("images/logo.png", open("logo.png", "rb").read(), "image/png")
+data = bucket.download("images/logo.png")
+meta = bucket.get_metadata("images/logo.png")
+print(meta["download_token"])
+token = bucket.rotate_token("images/logo.png")
+objs = bucket.list_objects(prefix="images/")
+```
 
 ## Quickstart
 
@@ -118,36 +267,24 @@ openfirebase serve --data-dir ./.openfirebase --public ./public
 ```
 
 ```bash
-# Firestore: create + read a document
-curl -s -XPOST localhost:8080/v1/firestore/users -d '{"name":"Ada","age":36}'
-# -> {"id":"<doc_id>"}
-curl -s localhost:8080/v1/firestore/users/<doc_id>
+# Firestore: create + query
+curl -s -XPOST localhost:8080/v1/firestore/products -d '{"name":"apple","price":3}'
+curl -s -XPOST localhost:8080/v1/firestore/_query/products \
+     -d '{"where":[{"field":"price","op":">","value":1}],"order_by":[{"field":"price","direction":"asc"}]}'
 
-# Realtime tree: write + read
-curl -s -XPUT localhost:8080/v1/rtdb/rooms/r1 -d '{"value":{"name":"Lobby"}}'
-curl -s localhost:8080/v1/rtdb/rooms/r1
+# Realtime DB: query
+curl -s "localhost:8080/v1/rtdb/_query/scores?orderByChild=score&limitToFirst=5"
 
-# Auth: sign up (returns a local id_token), then verify it
-curl -s -XPOST localhost:8080/v1/auth/signup -d '{"email":"a@b.com","password":"secret1"}'
-curl -s -XPOST localhost:8080/v1/auth/verify -d '{"id_token":"<token>"}'
-```
+# RTDB transaction
+curl -s -XPOST localhost:8080/v1/rtdb/_transaction/counters/visits -d '{"op":"increment","value":1}'
 
-Use it as a library too:
-
-```python
-from openfirebase import Firestore, RealtimeDatabase, AuthService
-
-fs = Firestore()                       # in-memory
-fs.set("cities", "LA", {"pop": 4_000_000})
-print(fs.collection("cities").where("pop", ">", 1_000_000).stream())
-
-db = RealtimeDatabase()
-db.update("/users/u1", {"name": "Bo"})
-db.push("/users/u1/messages", {"text": "hi"})
-
-auth = AuthService(secret="dev")
-token = auth.sign_up("a@b.com", "secret1") and auth.sign_in("a@b.com", "secret1")["id_token"]
-print(auth.verify_token(token))
+# Cloud Storage: upload (base64 envelope)
+curl -s -XPOST localhost:8080/v1/storage/my-bucket/o/hello.txt \
+     -H 'Content-Type: application/json' \
+     -d '{"base64_data":"aGVsbG8=","content_type":"text/plain"}'
+curl -s localhost:8080/v1/storage/my-bucket/o/hello.txt           # download bytes
+curl -s localhost:8080/v1/storage/my-bucket/o/hello.txt/meta      # metadata
+curl -s -XPOST localhost:8080/v1/storage/my-bucket/o/hello.txt/token  # rotate token
 ```
 
 <!-- cognis:domains:start -->
@@ -206,7 +343,8 @@ Requires **Python 3.10+**. The runtime core has **no third-party dependencies**
 
 `firebase` · `firebase-emulator` · `local-development` · `offline-first` ·
 `firestore` · `realtime-database` · `authentication` · `static-hosting` ·
-`serverless-functions` · `testing` · `developer-tools` · `python` · `stdlib`
+`serverless-functions` · `cloud-storage` · `testing` · `developer-tools` ·
+`python` · `stdlib`
 
 ## Verification
 
@@ -214,29 +352,40 @@ The test suite is real and end-to-end: the HTTP server is started in a
 background thread and data is round-tripped through every service over the wire,
 alongside direct unit tests of each service class and both storage backends.
 
-- **85 tests, all passing** (`python -m pytest -q`) on Python 3.14 locally.
+- **204 tests, all passing** (`python -m pytest -q`) on Python 3.14 locally.
 - CI runs the same suite on **ubuntu / macOS / windows × Python 3.10–3.13**
   (see `.github/workflows/ci.yml`).
 
 Coverage by area: storage backends (memory + sqlite, incl. persistence),
-Firestore CRUD + every query operator + ordering/limit/merge, realtime tree
-nesting/merge/push-ordering/delete, auth sign-up/sign-in/token verify/tamper/
-expiry/wrong-secret, function trigger dispatch + prefix filtering + error
-isolation + HTTP invoke, hosting index/SPA/traversal, the CLI, and the full
-HTTP server end-to-end.
+Firestore CRUD + every query operator (incl. `array-contains-any`, `not-in`,
+`!=`) + ordering/limit/limit-to-last/merge + cursor pagination
+(start_after/start_at/end_before/end_at) + FieldValue (increment/arrayUnion/
+arrayRemove/serverTimestamp/delete) + subcollections + WriteBatch + Transaction
+(optimistic-lock/conflict-retry/abort), realtime tree nesting/merge/push-
+ordering/delete + RTDBQuery (orderByChild/orderByKey/orderByValue/equalTo/
+limitToFirst/limitToLast/startAt/endAt) + atomic transaction + OnDisconnect
+(set/remove/update/cancel/simulate_disconnect), Cloud Storage (bucket lifecycle,
+upload/download binary fidelity MD5 check, metadata get/patch/custom_metadata,
+prefix listing, download-token generate/rotate, base64-envelope and raw-bytes
+upload, path-like object names), auth sign-up/sign-in/token verify/tamper/expiry/
+wrong-secret, function trigger dispatch + prefix filtering + error isolation +
+HTTP invoke, hosting index/SPA/traversal, the CLI, and the full HTTP server
+end-to-end.
 
 ## Roadmap (not yet implemented)
 
 These are intentionally **not** built yet and are listed honestly so nothing is
 overclaimed:
 
-- Firestore: composite indexes, sub-collections, transactions, real-time
-  listeners/streaming, full pagination cursors, collection enumeration.
-- Realtime DB: server-sent-event subscriptions, security rules, transactions.
+- Firestore: collection-group queries, collection enumeration, real-time
+  listeners/streaming, index-enforced composite sorts, security rules.
+- Realtime DB: server-sent-event subscriptions, security rules, persistent
+  onDisconnect across connections (current stub is in-process only).
 - Auth: OAuth/OIDC providers, email verification flows, password reset, refresh
   tokens (current tokens are short-lived HMAC blobs for local dev only).
 - Functions: scheduled/pub-sub triggers, async/background execution.
-- Storage: a Cloud-Storage-style object/blob bucket service.
+- Cloud Storage: ACL/IAM rules, resumable uploads, object versioning, signed URLs
+  (current download tokens are opaque UUIDs, not time-limited signed URLs).
 
 ## License
 
