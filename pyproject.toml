@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openfirebase"
+version = "0.1.0"
+description = "Independent open-source LOCAL reimplementation of core Firebase developer primitives (Firestore-style docs, realtime JSON tree, local auth, static hosting, function triggers) for local development and testing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "COCL-1.0" }
+authors = [{ name = "Cognis Digital", email = "engineering@cognisdigital.com" }]
+keywords = ["firebase", "emulator", "local-development", "firestore", "realtime-database", "auth", "hosting", "functions", "testing", "offline"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Database",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/cognis-digital/openfirebase"
+Repository = "https://github.com/cognis-digital/openfirebase"
+
+[project.scripts]
+openfirebase = "openfirebase.cli:main"
+
+[tool.setuptools]
+packages = ["openfirebase"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
