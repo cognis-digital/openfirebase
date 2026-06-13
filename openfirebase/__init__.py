@@ -9,11 +9,17 @@ compatibility. It implements a compatible SUBSET and is not intended for product
 from .firestore import Firestore, Query, FieldValue, WriteBatch, Transaction, TransactionError
 from .rtdb import RealtimeDatabase, RTDBQuery, OnDisconnect
 from .auth import AuthService, AuthError
-from .functions import FunctionRegistry, trigger
+from .functions import (
+    FunctionRegistry, FunctionError, trigger,
+    ON_CREATE, ON_WRITE, ON_UPDATE, ON_DELETE,
+    ON_AUTH_USER_CREATE, ON_AUTH_USER_DELETE,
+    ON_STORAGE_FINALIZE, ON_STORAGE_DELETE,
+    ON_PUBSUB_MESSAGE, ON_SCHEDULE,
+)
 from .hosting import Hosting
 from .cloudstorage import CloudStorage, StorageBucket, ObjectNotFoundError
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Firestore",
@@ -28,7 +34,18 @@ __all__ = [
     "AuthService",
     "AuthError",
     "FunctionRegistry",
+    "FunctionError",
     "trigger",
+    "ON_CREATE",
+    "ON_WRITE",
+    "ON_UPDATE",
+    "ON_DELETE",
+    "ON_AUTH_USER_CREATE",
+    "ON_AUTH_USER_DELETE",
+    "ON_STORAGE_FINALIZE",
+    "ON_STORAGE_DELETE",
+    "ON_PUBSUB_MESSAGE",
+    "ON_SCHEDULE",
     "Hosting",
     "CloudStorage",
     "StorageBucket",

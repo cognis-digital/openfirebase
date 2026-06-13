@@ -10,13 +10,27 @@ Path prefixes
 * ``/v1/rtdb/<path...>``                      - realtime JSON tree (REST)
 * ``/v1/rtdb/_query/<path...>``              - RTDB query (GET)
 * ``/v1/rtdb/_transaction/<path...>``        - RTDB transaction (POST)
-* ``/v1/auth/signup`` ``/v1/auth/signin`` ``/v1/auth/verify`` - local auth
+* ``/v1/auth/signup``                        - create user
+* ``/v1/auth/signin``                        - sign in
+* ``/v1/auth/verify``                        - verify id-token
+* ``/v1/auth/users``                         - list users (GET) / get user (GET /<uid>)
+* ``/v1/auth/users/<uid>``                   - update (PATCH) / delete (DELETE) user
+* ``/v1/auth/custom-token``                  - mint custom token (POST)
+* ``/v1/auth/password-reset``                - generate/confirm password reset
+* ``/v1/auth/email-verification``            - generate/confirm email verification
+* ``/v1/auth/provider-signin``               - provider sign-in stub (POST)
+* ``/v1/auth/set-custom-claims``             - set custom claims (POST)
 * ``/v1/functions/<name>``                    - invoke an onRequest function
+* ``/v1/functions/_callable/<name>``          - invoke a callable function
+* ``/v1/functions/_pubsub/<topic>``           - publish a Pub/Sub message (POST)
+* ``/v1/functions/_schedule/<name>``          - run a scheduled function (POST)
 * ``/v1/storage/<bucket>/o``                  - list objects
 * ``/v1/storage/<bucket>/o/<name>``           - upload/download/delete object
 * ``/v1/storage/<bucket>/o/<name>/meta``      - get/patch object metadata
 * ``/v1/storage/<bucket>/o/<name>/token``     - rotate download token
 * ``/v1/storage``                             - list buckets
+* ``/v1/hosting/channels``                    - list preview channels (GET)
+* ``/v1/hosting/channels/<name>``             - create/delete preview channel
 * ``/__health``                               - liveness probe
 * anything else                               - static hosting (if enabled)
 
@@ -35,7 +49,9 @@ from urllib.parse import urlparse, parse_qs
 from .auth import AuthService, AuthError
 from .cloudstorage import CloudStorage, ObjectNotFoundError
 from .firestore import Firestore, FieldValue, TransactionError
-from .functions import (FunctionRegistry, ON_CREATE, ON_UPDATE, ON_DELETE)
+from .functions import (FunctionRegistry, ON_CREATE, ON_UPDATE, ON_DELETE,
+                        ON_STORAGE_FINALIZE, ON_STORAGE_DELETE,
+                        ON_AUTH_USER_CREATE, ON_AUTH_USER_DELETE)
 from .hosting import Hosting
 from .rtdb import RealtimeDatabase
 from .storage import make_store
@@ -139,6 +155,9 @@ def _make_handler(app: App):
                     return self._functions(method, path, body, query)
                 if path.startswith("/v1/storage"):
                     return self._storage_route(method, path, query)
+                if path.startswith("/v1/hosting"):
+                    body = self._safe_json_body(method)
+                    return self._hosting_mgmt(method, path, body)
                 return self._static(path)
             except AuthError as exc:
                 return self._send_json({"error": str(exc)}, 401)
@@ -464,28 +483,204 @@ def _make_handler(app: App):
 
         # ---- auth ---------------------------------------------------------
         def _auth(self, method, path, body):
-            action = path[len("/v1/auth"):].strip("/")
+            sub = path[len("/v1/auth"):].lstrip("/")
+            # split off leading segment for routing, keeping rest as tail
+            parts = sub.split("/", 1)
+            action = parts[0]
+            tail = parts[1] if len(parts) > 1 else ""
             auth = app.auth
+
+            # ---- basic sign-up/sign-in/verify (unchanged) ---
             if action == "signup" and method == "POST":
-                user = auth.sign_up(body.get("email", ""), body.get("password", ""),
+                user = auth.sign_up(body.get("email", ""),
+                                    body.get("password", ""),
                                     body.get("display_name"))
                 token = auth.issue_token(user["uid"])
+                app.functions.dispatch_auth(ON_AUTH_USER_CREATE, dict(user))
                 return self._send_json({"user": user, "id_token": token}, 201)
+
             if action == "signin" and method == "POST":
                 return self._send_json(auth.sign_in(body.get("email", ""),
                                                     body.get("password", "")))
+
             if action == "verify" and method == "POST":
                 payload = auth.verify_token(body.get("id_token", ""))
                 return self._send_json({"valid": True, "claims": payload})
+
+            # ---- custom-token ---
+            if action == "custom-token" and method == "POST":
+                uid = body.get("uid", "")
+                if not uid:
+                    return self._send_json({"error": "uid required"}, 400)
+                token = auth.mint_custom_token(
+                    uid,
+                    custom_claims=body.get("custom_claims"),
+                    ttl=body.get("ttl"),
+                )
+                return self._send_json({"custom_token": token})
+
+            if action == "verify-custom-token" and method == "POST":
+                try:
+                    payload = auth.verify_custom_token(body.get("token", ""))
+                    return self._send_json({"valid": True, "claims": payload})
+                except AuthError as exc:
+                    return self._send_json({"error": str(exc)}, 401)
+
+            # ---- user CRUD ---
+            if action == "users":
+                if method == "GET" and not tail:
+                    page_size = int(body.get("page_size", 100)) \
+                        if isinstance(body, dict) else 100
+                    page_token = (body.get("page_token") or None) \
+                        if isinstance(body, dict) else None
+                    return self._send_json(auth.list_users(page_size, page_token))
+                if tail:
+                    uid = tail
+                    if method == "GET":
+                        user = auth.get_user(uid)
+                        if user is None:
+                            return self._send_json({"error": "not found"}, 404)
+                        return self._send_json(user)
+                    if method == "PATCH":
+                        try:
+                            user = auth.update_user(uid, **{
+                                k: v for k, v in body.items()
+                                if k in {"email", "password", "display_name",
+                                         "disabled", "email_verified",
+                                         "custom_claims"}
+                            })
+                            return self._send_json(user)
+                        except AuthError as exc:
+                            return self._send_json({"error": str(exc)}, 400)
+                    if method == "DELETE":
+                        user = auth.get_user(uid)
+                        ok = auth.delete_user(uid)
+                        if ok and user:
+                            app.functions.dispatch_auth(ON_AUTH_USER_DELETE, dict(user))
+                        return self._send_json({"deleted": ok})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            # ---- password-reset flow ---
+            if action == "password-reset":
+                if method == "POST":
+                    sub_action = body.get("action", "generate")
+                    if sub_action == "generate":
+                        email = body.get("email", "")
+                        try:
+                            token = auth.generate_password_reset_token(email)
+                            return self._send_json({"reset_token": token})
+                        except AuthError as exc:
+                            return self._send_json({"error": str(exc)}, 400)
+                    if sub_action == "confirm":
+                        try:
+                            auth.confirm_password_reset(
+                                body.get("reset_token", ""),
+                                body.get("new_password", ""),
+                            )
+                            return self._send_json({"status": "ok"})
+                        except AuthError as exc:
+                            return self._send_json({"error": str(exc)}, 400)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            # ---- email-verification flow ---
+            if action == "email-verification":
+                if method == "POST":
+                    sub_action = body.get("action", "generate")
+                    if sub_action == "generate":
+                        uid = body.get("uid", "")
+                        try:
+                            token = auth.generate_email_verification_token(uid)
+                            return self._send_json({"verification_token": token})
+                        except AuthError as exc:
+                            return self._send_json({"error": str(exc)}, 400)
+                    if sub_action == "confirm":
+                        try:
+                            user = auth.confirm_email_verification(
+                                body.get("verification_token", ""))
+                            return self._send_json(user)
+                        except AuthError as exc:
+                            return self._send_json({"error": str(exc)}, 400)
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            # ---- provider sign-in stub ---
+            if action == "provider-signin" and method == "POST":
+                try:
+                    result = auth.sign_in_with_provider(
+                        body.get("provider_id", ""),
+                        body.get("provider_uid", ""),
+                        email=body.get("email"),
+                        display_name=body.get("display_name"),
+                    )
+                    return self._send_json(result)
+                except AuthError as exc:
+                    return self._send_json({"error": str(exc)}, 400)
+
+            # ---- custom claims ---
+            if action == "set-custom-claims" and method == "POST":
+                uid = body.get("uid", "")
+                claims = body.get("custom_claims", {})
+                try:
+                    user = auth.set_custom_claims(uid, claims)
+                    return self._send_json(user)
+                except AuthError as exc:
+                    return self._send_json({"error": str(exc)}, 400)
+
             return self._send_json({"error": "unknown auth action"}, 404)
 
         # ---- functions ----------------------------------------------------
         def _functions(self, method, path, body, query):
-            name = path[len("/v1/functions"):].strip("/")
-            if not name:
-                return self._send_json(
-                    {"http": app.functions.list_http_handlers(),
-                     "db": app.functions.list_db_handlers()})
+            sub = path[len("/v1/functions"):].lstrip("/")
+
+            # Listing endpoint
+            if not sub:
+                return self._send_json({
+                    "http": app.functions.list_http_handlers(),
+                    "callable": app.functions.list_callable_handlers(),
+                    "db": app.functions.list_db_handlers(),
+                    "auth": app.functions.list_auth_handlers(),
+                    "storage": app.functions.list_storage_handlers(),
+                    "pubsub": app.functions.list_pubsub_handlers(),
+                    "scheduled": app.functions.list_scheduled(),
+                })
+
+            # Callable endpoint: POST /v1/functions/_callable/<name>
+            if sub.startswith("_callable/"):
+                name = sub[len("_callable/"):]
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                try:
+                    result = app.functions.call_callable(
+                        name,
+                        body.get("data") if isinstance(body, dict) else body,
+                        body.get("context") if isinstance(body, dict) else None,
+                    )
+                    return self._send_json(result)
+                except KeyError:
+                    return self._send_json({"error": f"no callable {name!r}"}, 404)
+
+            # Pub/Sub publish: POST /v1/functions/_pubsub/<topic>
+            if sub.startswith("_pubsub/"):
+                topic = sub[len("_pubsub/"):]
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                message = body.get("message") if isinstance(body, dict) else body
+                results = app.functions.publish(topic, message)
+                return self._send_json({"topic": topic, "results": results,
+                                        "count": len(results)})
+
+            # Scheduled run: POST /v1/functions/_schedule/<name>
+            if sub.startswith("_schedule/"):
+                name = sub[len("_schedule/"):]
+                if method != "POST":
+                    return self._send_json({"error": "method not allowed"}, 405)
+                try:
+                    result = app.functions.run_scheduled(name)
+                    return self._send_json({"result": result})
+                except KeyError:
+                    return self._send_json({"error": f"no scheduled {name!r}"}, 404)
+
+            # Default: onRequest invocation
+            name = sub
             try:
                 request = {"method": method, "body": body, "query": query}
                 result = app.functions.call_request(name, request)
@@ -567,6 +762,7 @@ def _make_handler(app: App):
                 if not isinstance(data, (bytes, bytearray)):
                     data = b""
                 meta = cs.upload(bucket, obj_name, data, ctype, custom_metadata=custom)
+                app.functions.dispatch_storage(ON_STORAGE_FINALIZE, dict(meta))
                 return self._send_json(meta, 201)
 
             if method == "GET":
@@ -580,7 +776,13 @@ def _make_handler(app: App):
                 return self._send_bytes(data, ctype)
 
             if method == "DELETE":
+                try:
+                    meta_before = cs.get_metadata(bucket, obj_name)
+                except ObjectNotFoundError:
+                    meta_before = None
                 ok = cs.delete(bucket, obj_name)
+                if ok and meta_before:
+                    app.functions.dispatch_storage(ON_STORAGE_DELETE, dict(meta_before))
                 return self._send_json({"deleted": ok})
 
             return self._send_json({"error": "method not allowed"}, 405)
@@ -606,15 +808,72 @@ def _make_handler(app: App):
                     return self._send_json({"error": "not found"}, 404)
             return self._send_json({"error": "method not allowed"}, 405)
 
-        # ---- static hosting ----------------------------------------------
+        # ---- static hosting (file serving) ----------------------------------
         def _static(self, path):
             if app.hosting is None:
                 return self._send_json({"error": "not found"}, 404)
-            served = app.hosting.serve(path)
+            # Check redirect rules first
+            redir = app.hosting.check_redirect(path)
+            if redir is not None:
+                self.send_response(redir["status"])
+                self.send_header("Location", redir["destination"])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # Check rewrite → function stub
+            rewrite = app.hosting.check_rewrite(path)
+            if rewrite and "function" in rewrite:
+                # Attempt to call the function; fall through to 404 if missing
+                fn_name = rewrite["function"]
+                try:
+                    result = app.functions.call_request(
+                        fn_name,
+                        {"method": "GET", "body": {}, "query": {}, "path": path},
+                    )
+                    return self._send_json({"result": result})
+                except KeyError:
+                    return self._send_json(
+                        {"error": f"function {fn_name!r} not registered"}, 404)
+            served = app.hosting.serve_with_headers(path)
             if served is None:
                 return self._send_json({"error": "not found"}, 404)
-            data, ctype = served
-            return self._send_bytes(data, ctype)
+            data, ctype, extra = served
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in extra.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        # ---- hosting management (channels / config) -----------------------
+        def _hosting_mgmt(self, method, path, body):
+            if app.hosting is None:
+                return self._send_json({"error": "hosting not configured"}, 400)
+            sub = path[len("/v1/hosting"):].lstrip("/")
+
+            if sub == "channels" or sub == "channels/":
+                if method == "GET":
+                    return self._send_json({
+                        "channels": app.hosting.list_channels()
+                    })
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            if sub.startswith("channels/"):
+                channel_name = sub[len("channels/"):]
+                if method == "POST":
+                    overlay = (body.get("dir") if isinstance(body, dict) else None)
+                    app.hosting.create_channel(channel_name, overlay)
+                    return self._send_json({
+                        "name": channel_name,
+                        "url": app.hosting.get_channel_url(channel_name),
+                    }, 201)
+                if method == "DELETE":
+                    ok = app.hosting.delete_channel(channel_name)
+                    return self._send_json({"deleted": ok})
+                return self._send_json({"error": "method not allowed"}, 405)
+
+            return self._send_json({"error": "unknown hosting endpoint"}, 404)
 
     return Handler
 

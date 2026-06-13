@@ -58,11 +58,15 @@ It gives a developer seven things behind one local HTTP server:
   subcollections, transactions, batched writes, and FieldValue sentinels),
 - a **realtime JSON tree** (read/write/merge/push at any path, orderByChild
   queries, atomic transactions, onDisconnect/presence stubs),
-- a **local auth** service (email/password sign-up & sign-in issuing signed
-  local tokens you can verify — for dev only, **not** a real identity provider),
-- a **static hosting** server for your front-end build output,
-- a **function-trigger runner** that fires your Python handlers on database
-  events (`onCreate` / `onWrite` / `onDelete`) or HTTP requests (`onRequest`),
+- a **local auth** service (email/password + custom-token + provider-sign-in
+  stubs, PBKDF2 hashing, HMAC tokens with custom claims, user CRUD + listUsers,
+  password-reset and email-verification OTP flows — for dev only, **not** a
+  real identity provider),
+- a **static hosting** server with rewrites, redirects, custom headers, and
+  preview channels,
+- a **function-trigger runner** that fires Python handlers on Firestore/RTDB
+  database events, Auth events, Storage events, HTTP requests, callable
+  functions (structured errors), Pub/Sub messages, and scheduled jobs,
 - a **Cloud Storage** emulator (bucket/object store with upload/download/metadata
   and download tokens), and
 - a single shared storage backend (in-memory or SQLite) wiring all of them
@@ -110,10 +114,10 @@ ephemeral instance. The HTTP layer is std-lib `http.server` only.
 |-------------------|----------------------------------|-------------------|-----------------------------------|------------------------------------------------------------------------------------------------------------------------|
 | Firestore         | Cloud Firestore (subset)         | `firestore.py`    | `/v1/firestore/...`               | collections/documents, `where` (all operators incl. `array-contains-any`), `order_by`, `limit`/`limit_to_last`, cursor pagination (`start_after`/`start_at`/`end_before`/`end_at`), composite AND filters, subcollections, `FieldValue` (increment/arrayUnion/arrayRemove/serverTimestamp/delete), `WriteBatch`, `Transaction` (optimistic-lock + retry), merge |
 | Realtime DB       | Realtime Database (subset)       | `rtdb.py`         | `/v1/rtdb/...`                    | JSON tree, `get`/`set`/`update`/`push`/`delete`, `RTDBQuery` (orderByChild/orderByKey/orderByValue/equalTo/startAt/endAt/limitToFirst/limitToLast), atomic `transaction`, `OnDisconnect` presence stub |
-| Auth              | Authentication (subset)          | `auth.py`         | `/v1/auth/...`                    | email+password, PBKDF2 hashing, HMAC local tokens, verify                                                             |
-| Hosting           | Hosting (subset)                 | `hosting.py`      | `/` (static)                      | directory index, SPA fallback, path-traversal protection                                                               |
-| Functions         | Cloud Functions (subset)         | `functions.py`    | `/v1/functions/...`               | DB triggers + `onRequest` HTTP handlers, error isolation                                                               |
-| Cloud Storage     | Cloud Storage for Firebase       | `cloudstorage.py` | `/v1/storage/...`                 | buckets, objects (upload/download/delete/list), metadata (get/patch/custom_metadata), download tokens (generate/rotate), prefix listing, binary + base64 upload, MD5 checksum |
+| Auth              | Authentication (deep)            | `auth.py`         | `/v1/auth/...`                    | email+password, PBKDF2 hashing, HMAC tokens, custom-token mint/verify, custom claims, `update_user`, `list_users` (paginated), password-reset OTP flow, email-verification OTP flow, provider sign-in stubs (Google/GitHub/Facebook/Twitter/Apple/Microsoft/anonymous), `set_custom_claims`, Auth triggers (onCreate/onDelete) |
+| Hosting           | Hosting (deep)                   | `hosting.py`      | `/` (static) `/v1/hosting/...`    | directory index, SPA fallback, path-traversal guard, **rewrites** (path + function proxy), **redirects** (301/302/307/308), **custom headers** per glob pattern, **preview channels** (named overlay dirs) |
+| Functions         | Cloud Functions (deep)           | `functions.py`    | `/v1/functions/...`               | DB triggers (Firestore/RTDB, onCreate/onWrite/onUpdate/onDelete), **callable functions** (`on_call`, `FunctionError`), **Auth triggers** (onAuthUserCreate/onAuthUserDelete), **Storage triggers** (onStorageObjectFinalize/onStorageObjectDelete), **Pub/Sub** (publish + subscribe, per-topic), **scheduled functions** (register + run on demand), `onRequest` HTTP handlers, error isolation |
+| Cloud Storage     | Cloud Storage for Firebase       | `cloudstorage.py` | `/v1/storage/...`                 | buckets, objects (upload/download/delete/list), metadata (get/patch/custom_metadata), download tokens (generate/rotate), prefix listing, binary + base64 upload, MD5 checksum, Storage triggers wired to Functions |
 
 ## HTTP API reference
 
@@ -194,7 +198,159 @@ PATCH  /v1/storage/<bucket>/o/<name>/meta   update custom_metadata
 POST   /v1/storage/<bucket>/o/<name>/token  rotate download token
 ```
 
-## Library API highlights (new in storage+data pass)
+### Auth (deep — messaging+compute pass)
+
+```
+POST   /v1/auth/signup                           create user (email+password)
+POST   /v1/auth/signin                           sign in (email+password)
+POST   /v1/auth/verify                           verify id-token
+POST   /v1/auth/custom-token                     mint custom token
+    {"uid":"...", "custom_claims":{...}, "ttl": 3600}
+POST   /v1/auth/verify-custom-token              verify custom token
+    {"token":"..."}
+GET    /v1/auth/users                            list users (paginated)
+GET    /v1/auth/users/<uid>                      get user by uid
+PATCH  /v1/auth/users/<uid>                      update user (display_name/email/password/disabled/email_verified/custom_claims)
+DELETE /v1/auth/users/<uid>                      delete user (fires onAuthUserDelete)
+POST   /v1/auth/password-reset                   password reset flow
+    {"action":"generate","email":"..."}          → {"reset_token":"..."}
+    {"action":"confirm","reset_token":"...","new_password":"..."}
+POST   /v1/auth/email-verification               email verification flow
+    {"action":"generate","uid":"..."}            → {"verification_token":"..."}
+    {"action":"confirm","verification_token":"..."}
+POST   /v1/auth/provider-signin                  provider sign-in stub
+    {"provider_id":"google.com","provider_uid":"...","email":"...","display_name":"..."}
+POST   /v1/auth/set-custom-claims                set custom claims
+    {"uid":"...", "custom_claims":{...}}
+```
+
+### Functions (deep — messaging+compute pass)
+
+```
+GET    /v1/functions                             list all handlers (all types)
+POST   /v1/functions/<name>                      invoke onRequest handler
+POST   /v1/functions/_callable/<name>            invoke callable function
+    {"data":{...}, "context":{...}}              → {"result":...} or {"error":{...}}
+POST   /v1/functions/_pubsub/<topic>             publish Pub/Sub message
+    {"message":{...}}                            → {"topic":..., "count":..., "results":[...]}
+POST   /v1/functions/_schedule/<name>            run scheduled function on demand
+                                                 → {"result":...}
+```
+
+### Hosting management (messaging+compute pass)
+
+```
+GET    /v1/hosting/channels                      list preview channels
+POST   /v1/hosting/channels/<name>               create preview channel
+    {"dir":"/path/to/overlay"}                   → {"name":"...", "url":"..."}
+DELETE /v1/hosting/channels/<name>               delete preview channel
+```
+
+Hosting rewrites, redirects, and headers are configured in-process via the
+`Hosting` constructor kwargs (`rewrites`, `redirects`, `headers`) or by
+mutating the `app.hosting.rewrites` / `app.hosting.redirects` /
+`app.hosting.headers_rules` lists.
+
+## Library API highlights (new in messaging+compute pass)
+
+```python
+from openfirebase import (
+    AuthService, FunctionRegistry, FunctionError, Hosting,
+    ON_AUTH_USER_CREATE, ON_AUTH_USER_DELETE,
+    ON_STORAGE_FINALIZE, ON_STORAGE_DELETE,
+)
+
+# ---- Auth deep features ----
+auth = AuthService(secret="dev-secret")
+user = auth.sign_up("ada@example.com", "password1")
+
+# Custom token with claims
+token = auth.mint_custom_token(user["uid"], custom_claims={"role": "admin"})
+payload = auth.verify_custom_token(token)  # payload["custom_claims"]["role"] == "admin"
+
+# User CRUD
+auth.update_user(user["uid"], display_name="Ada", custom_claims={"plan": "pro"})
+auth.update_user(user["uid"], disabled=True)      # blocks sign-in
+page = auth.list_users(page_size=50)              # {"users": [...], "next_page_token": ...}
+
+# Password reset OTP flow
+reset_tok = auth.generate_password_reset_token("ada@example.com")
+auth.confirm_password_reset(reset_tok, "new-password1")
+
+# Email verification OTP flow
+verify_tok = auth.generate_email_verification_token(user["uid"])
+auth.confirm_email_verification(verify_tok)       # sets email_verified=True
+
+# Provider sign-in stub
+result = auth.sign_in_with_provider("google.com", "google-uid-123",
+                                    email="ada@gmail.com")
+# result["id_token"] is a valid local token for the linked/created user
+
+# ---- Functions deep features ----
+reg = FunctionRegistry()
+
+# Callable function (Firebase callable-style)
+@reg.on_call("add")
+def add(data, context):
+    return data["a"] + data["b"]
+
+result = reg.call_callable("add", {"a": 3, "b": 4})  # {"result": 7}
+
+# Structured error
+@reg.on_call("check")
+def check(data, context):
+    raise FunctionError("permission denied", code="permission-denied")
+
+# Auth triggers
+@reg.on_auth_user(ON_AUTH_USER_CREATE)
+def on_user_created(user):
+    print(f"new user: {user['uid']}")
+
+# Storage triggers
+@reg.on_storage(ON_STORAGE_FINALIZE, bucket_prefix="uploads/")
+def on_upload(meta):
+    print(f"uploaded: {meta['name']} ({meta['size']} bytes)")
+
+# Pub/Sub
+@reg.on_pubsub("events")
+def on_event(ctx):
+    print(f"received: {ctx['message']}")
+
+reg.publish("events", {"type": "click"})  # fires all subscribers
+
+# Scheduled
+@reg.schedule("nightly", cron="0 0 * * *")
+def nightly(ctx):
+    return "done"
+
+reg.run_scheduled("nightly")
+
+# ---- Hosting deep features ----
+hosting = Hosting(
+    "./public",
+    spa_fallback=True,
+    rewrites=[
+        {"source": "/api/**", "function": "myApiFunction"},
+    ],
+    redirects=[
+        {"source": "/old", "destination": "/new", "type": 301},
+    ],
+    headers=[
+        {"source": "**/*.html", "headers": [
+            {"key": "X-Frame-Options", "value": "DENY"},
+        ]},
+    ],
+)
+
+# Preview channels
+hosting.create_channel("beta", "./public-beta")
+hosting.get_channel_url("beta")   # http://localhost:8080/__channel/beta/
+# serve with channel overlay:
+hosting.serve("/index.html", channel="beta")
+hosting.serve_with_headers("/index.html")  # (data, ctype, extra_headers)
+```
+
+## Library API highlights (storage+data pass)
 
 ```python
 from openfirebase import Firestore, RealtimeDatabase, CloudStorage
@@ -352,7 +508,7 @@ The test suite is real and end-to-end: the HTTP server is started in a
 background thread and data is round-tripped through every service over the wire,
 alongside direct unit tests of each service class and both storage backends.
 
-- **204 tests, all passing** (`python -m pytest -q`) on Python 3.14 locally.
+- **352 tests, all passing** (`python -m pytest -q`) on Python 3.14 locally.
 - CI runs the same suite on **ubuntu / macOS / windows × Python 3.10–3.13**
   (see `.github/workflows/ci.yml`).
 
@@ -367,10 +523,23 @@ limitToFirst/limitToLast/startAt/endAt) + atomic transaction + OnDisconnect
 (set/remove/update/cancel/simulate_disconnect), Cloud Storage (bucket lifecycle,
 upload/download binary fidelity MD5 check, metadata get/patch/custom_metadata,
 prefix listing, download-token generate/rotate, base64-envelope and raw-bytes
-upload, path-like object names), auth sign-up/sign-in/token verify/tamper/expiry/
-wrong-secret, function trigger dispatch + prefix filtering + error isolation +
-HTTP invoke, hosting index/SPA/traversal, the CLI, and the full HTTP server
-end-to-end.
+upload, path-like object names), Auth (sign-up/sign-in/token verify/tamper/expiry/
+wrong-secret, custom-token mint+verify, custom claims, update_user, list_users
+pagination, password-reset OTP flow, email-verification OTP flow, provider
+sign-in stubs for 7 providers incl. anonymous, disabled-user rejection, provider
+index cleanup on delete), Functions (DB trigger dispatch + prefix filtering +
+error isolation + HTTP invoke, callable functions + FunctionError, Auth triggers
+onCreate/onDelete, Storage triggers onFinalize/onDelete + bucket prefix,
+Pub/Sub publish+subscribe + multi-topic + error isolation, scheduled function
+register+run + last_run tracking, full introspection for all handler types),
+Hosting (serve/resolve/SPA-fallback/path-traversal + rewrites path+function,
+redirects 301/302/default, custom headers merged-from-multiple-rules, preview
+channels create/list/delete/overlay-shadow/fall-through, serve_with_headers
+three-tuple API, backward-compat two-tuple API), storage triggers wired via
+server (finalize on upload, delete on object delete), auth triggers wired via
+server (onCreate on signup, onDelete on user delete), hosting management HTTP
+endpoints (channels list/create/delete), callable+pubsub+schedule HTTP endpoints,
+the CLI, and the full HTTP server end-to-end for all services.
 
 ## Roadmap (not yet implemented)
 
@@ -381,11 +550,16 @@ overclaimed:
   listeners/streaming, index-enforced composite sorts, security rules.
 - Realtime DB: server-sent-event subscriptions, security rules, persistent
   onDisconnect across connections (current stub is in-process only).
-- Auth: OAuth/OIDC providers, email verification flows, password reset, refresh
-  tokens (current tokens are short-lived HMAC blobs for local dev only).
-- Functions: scheduled/pub-sub triggers, async/background execution.
+- Auth: real OAuth/OIDC round-trips (current provider sign-in is a stub that
+  skips the provider redirect flow); refresh tokens (current tokens are
+  short-lived HMAC blobs for local dev only).
+- Functions: async/background execution, true cron scheduling (current scheduled
+  functions run only when triggered via the HTTP endpoint or `run_scheduled()`
+  in-process; no built-in wall-clock scheduler).
 - Cloud Storage: ACL/IAM rules, resumable uploads, object versioning, signed URLs
   (current download tokens are opaque UUIDs, not time-limited signed URLs).
+- Hosting: CDN-style cache headers, i18n rewrites, multi-site support beyond
+  named in-process overlay channels.
 
 ## License
 
