@@ -744,6 +744,12 @@ overclaimed:
   (current providers are all accepted locally without real attestation); token
   exchange endpoint compatible with the Firebase SDK.
 
+## Interoperability
+
+`{}` composes with the 300+ tool Cognis suite — JSON in/out and a shared
+OpenAI-compatible `/v1` backbone. See **[INTEROP.md](INTEROP.md)** for the
+suite map, composition patterns, and reference stacks.
+
 ## License
 
 Released under the **Cognis Open Collaboration License (COCL) 1.0** — see
