@@ -373,10 +373,13 @@ class Transaction:
             # optimistic check: ensure all read docs are unchanged
             for (coll, doc_id), snap in self._reads.items():
                 current = self._db.get(coll, doc_id)
-                # compare _updated_at timestamp as version
-                snap_ts = (snap or {}).get("_updated_at") if snap else None
-                cur_ts = (current or {}).get("_updated_at") if current else None
-                if snap_ts != cur_ts:
+                # Monotonic _version is the source of truth (timestamps tie under
+                # coarse timers); existence change is also a conflict.
+                if (snap is None) != (current is None):
+                    raise _ConflictError()
+                snap_v = (snap or {}).get("_version")
+                cur_v = (current or {}).get("_version")
+                if snap_v != cur_v:
                     raise _ConflictError()
             # apply writes
             for op in self._writes:
@@ -414,6 +417,14 @@ class Firestore:
     def __init__(self, store: Optional[BaseStore] = None) -> None:
         self._store = store if store is not None else MemoryStore()
         self._lock = threading.RLock()
+        # Monotonic write counter used as the optimistic-locking version.
+        # (timestamps alone tie under coarse timers -> missed conflicts.)
+        self._version_counter = 0
+
+    def _next_version(self) -> int:
+        with self._lock:
+            self._version_counter += 1
+            return self._version_counter
 
     # ---- document level ---------------------------------------------------
 
@@ -443,6 +454,7 @@ class Firestore:
             payload["_created_at"] = (existing or {}).get("_created_at", now) \
                 if isinstance(existing, dict) else now
         payload["_updated_at"] = now
+        payload["_version"] = self._next_version()
         self._store.set(_ns(collection), doc_id, payload)
         return doc_id
 
@@ -468,6 +480,7 @@ class Firestore:
         for dk in to_delete:
             merged.pop(dk, None)
         merged["_updated_at"] = now
+        merged["_version"] = self._next_version()
         self._store.set(_ns(collection), doc_id, merged)
         return True
 
