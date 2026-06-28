@@ -1,5 +1,58 @@
 # openfirebase
 
+
+<!-- cognis:example:start -->
+## 🔎 Example output
+
+Real, reproducible output from the tool — runs offline:
+
+```console
+$ openfirebase-emit --help
+usage: openfirebase-emit [-h]
+                         --to {stix,taxii,misp,sigma,splunk,elastic,slack,discord,webhook,brief,findings}
+                         [--url URL] [--token TOKEN] [--dry-run]
+                         [input]
+
+forward openfirebase JSON findings to a platform via cognis-connect
+
+positional arguments:
+  input                 findings JSON file (default: stdin)
+
+options:
+  -h, --help            show this help message and exit
+  --to {stix,taxii,misp,sigma,splunk,elastic,slack,discord,webhook,brief,findings}
+  --url URL
+  --token TOKEN
+  --dry-run
+```
+
+> Blocks above are real `openfirebase` output — reproduce them from a clone.
+
+**Sample result format** _(illustrative values — run on your own data for real findings):_
+
+```
+{
+"findings": [
+    {
+        "id": "1234567890",
+        "title": "Suspicious Activity Detected",
+        "description": "Anomalous network traffic detected from IP 192.168.1.100",
+        "created_by": "John Doe",
+        "created_at": "2023-02-20T14:30:00Z"
+    },
+    {
+        "id": "2345678901",
+        "title": "Malware Detection",
+        "description": "Malicious code detected on system with IP 192.168.1.101",
+        "created_by": "Jane Smith",
+        "created_at": "2023-02-21T10:45:00Z"
+    }
+]
+}
+```
+
+<!-- cognis:example:end -->
+
 ## Usage — step by step
 
 A typical local-backend lifecycle with the `openfirebase` console command:
